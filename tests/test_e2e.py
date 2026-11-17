@@ -163,3 +163,100 @@ def test_end_to_end_errors_are_structured(server):
         )
         assert bad.status_code == 422
         assert bad.json()["code"] == "validation_error"
+
+
+def test_end_to_end_reconciliation_over_http(server):
+    with httpx.Client(base_url=server, timeout=10) as http:
+        intake = http.post(
+            "/intakes",
+            json={
+                "samples": [{"sample_id": "S1", "batch_nos": ["B1"]}],
+                "batches": [
+                    {
+                        "batch_no": "B1",
+                        "origin": "collection-lab",
+                        "destination": "hub-north",
+                        "departed_at": "2026-01-01T08:00:00Z",
+                        "arrived_at": "2026-01-01T10:00:00Z",
+                    }
+                ],
+            },
+        )
+        assert intake.status_code == 201, intake.text
+
+        receipts = http.post(
+            "/scans",
+            json={
+                "scans": [
+                    {
+                        "scan_id": "SC-1",
+                        "batch_no": "B1",
+                        "direction": "departure",
+                        "site": "collection-lab",
+                        "scanned_at": "2026-01-01T08:00:00Z",
+                    },
+                    {
+                        "scan_id": "SC-2",
+                        "batch_no": "B1",
+                        "direction": "arrival",
+                        "site": "hub-north",
+                        "scanned_at": "2026-01-01T10:05:00Z",
+                    },
+                ]
+            },
+        )
+        assert receipts.status_code == 201, receipts.text
+        assert receipts.json()["recorded"] == 2
+
+        # Identical re-report: idempotent, nothing new recorded.
+        duplicate = http.post(
+            "/scans",
+            json={
+                "scans": [
+                    {
+                        "scan_id": "SC-1",
+                        "batch_no": "B1",
+                        "direction": "departure",
+                        "site": "collection-lab",
+                        "scanned_at": "2026-01-01T08:00:00Z",
+                    }
+                ]
+            },
+        )
+        assert duplicate.status_code == 201
+        assert duplicate.json()["duplicates"] == 1
+        assert duplicate.json()["invalidated_reconciliation_ids"] == []
+
+        report = http.post("/batches/B1/reconciliations")
+        assert report.status_code == 201, report.text
+        body = report.json()
+        assert body["matched"] is False
+        assert [(f["kind"], f["direction"]) for f in body["findings"]] == [
+            ("time_mismatch", "arrival")
+        ]
+        recon_id = body["reconciliation_id"]
+
+        # A correction to the batch marks the published report stale.
+        correction = http.post(
+            "/batches/B1/corrections",
+            json={
+                "seen_version": 1,
+                "origin": "collection-lab",
+                "destination": "hub-north",
+                "departed_at": "2026-01-01T08:00:00Z",
+                "arrived_at": "2026-01-01T10:05:00Z",
+            },
+        )
+        assert correction.status_code == 200
+        assert correction.json()["invalidated_reconciliation_ids"] == [recon_id]
+
+        stale = http.get(f"/reconciliations/{recon_id}")
+        assert stale.status_code == 200
+        assert stale.json()["stale"] is True
+        assert stale.json()["findings"]  # audit rows remain readable
+
+        # Reconciling again against the corrected ledger matches.
+        fresh = http.post("/batches/B1/reconciliations").json()
+        assert fresh["matched"] is True
+        assert fresh["stale"] is False
+        assert fresh["ledger"]["version"] == 2

@@ -14,6 +14,19 @@ result; a failure leaves zero result rows.
 
 *Invalidation*: a correction marks every completed trace that pinned the
 superseded version. Reading such a trace returns 409 instead of stale data.
+
+*Scan receipts* are append-only facts keyed by a client-supplied ``scan_id``.
+Re-submitting identical content is a no-op; conflicting content is rejected.
+Receipts are never updated or deleted, so the set of receipts for a batch is
+exactly identified by the maximum row id (the *highwater mark*).
+
+*A reconciliation* pins one batch version and that batch's receipt highwater
+mark at acceptance. Findings and the ``complete`` flag are written in one
+transaction after re-checking both pins, so a report is never half-published
+and never published over inputs that moved during computation. A published
+report is marked stale (``reconciliation_invalidations``) when a new receipt
+for its batch is recorded or its batch is corrected; identical re-reports and
+unrelated batches do not affect it.
 """
 from __future__ import annotations
 
@@ -99,6 +112,48 @@ CREATE TABLE IF NOT EXISTS trace_invalidations (
     invalidated_at TEXT NOT NULL,
     reason         TEXT NOT NULL,
     PRIMARY KEY (trace_id, batch_no, version)
+);
+
+CREATE TABLE IF NOT EXISTS scans (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    intake_id   INTEGER NOT NULL REFERENCES intakes(id) ON DELETE CASCADE,
+    scan_id     TEXT NOT NULL,
+    batch_no    TEXT NOT NULL,
+    direction   TEXT NOT NULL CHECK (direction IN ('departure', 'arrival')),
+    site        TEXT NOT NULL,
+    scanned_at  TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    UNIQUE (intake_id, scan_id)
+);
+
+CREATE INDEX IF NOT EXISTS scans_by_batch ON scans(intake_id, batch_no, id);
+
+CREATE TABLE IF NOT EXISTS reconciliations (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    intake_id      INTEGER NOT NULL REFERENCES intakes(id),
+    batch_no       TEXT NOT NULL,
+    status         TEXT NOT NULL CHECK (status IN ('pending', 'complete', 'failed')),
+    batch_version  INTEGER NOT NULL,
+    scan_highwater INTEGER NOT NULL,
+    scan_count     INTEGER NOT NULL,
+    accepted_at    TEXT NOT NULL,
+    completed_at   TEXT,
+    error          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reconciliation_findings (
+    reconciliation_id INTEGER NOT NULL REFERENCES reconciliations(id) ON DELETE CASCADE,
+    rank         INTEGER NOT NULL,
+    kind         TEXT NOT NULL,
+    direction    TEXT NOT NULL,
+    detail_json  TEXT NOT NULL,
+    PRIMARY KEY (reconciliation_id, rank)
+);
+
+CREATE TABLE IF NOT EXISTS reconciliation_invalidations (
+    reconciliation_id INTEGER NOT NULL REFERENCES reconciliations(id) ON DELETE CASCADE,
+    reason         TEXT NOT NULL,
+    invalidated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS request_log (
@@ -222,22 +277,28 @@ class Store:
             conn.close()
 
     def mark_interrupted(self, *, older_than: timedelta = timedelta(minutes=10)) -> int:
-        """Fail stale pending traces left by a crashed process.
+        """Fail stale pending traces/reconciliations left by a crashed process.
 
-        Only traces accepted more than ``older_than`` ago are touched. With
+        Only rows accepted more than ``older_than`` ago are touched. With
         several API workers sharing one database, another worker may legitimately
-        be computing a trace right now; the grace period keeps startup recovery
-        from failing live work. A pending trace has no published rows, so
-        marking it failed never exposes partial data.
+        be computing right now; the grace period keeps startup recovery from
+        failing live work. A pending row has no published results, so marking
+        it failed never exposes partial data.
         """
         cutoff = iso(utcnow() - older_than)
+        now = iso(utcnow())
         with self.transaction() as conn:
             cur = conn.execute(
                 "UPDATE traces SET status='failed', completed_at=?,"
                 " error=? WHERE status='pending' AND accepted_at<?",
-                (iso(utcnow()), "interrupted before completion", cutoff),
+                (now, "interrupted before completion", cutoff),
             )
-            return cur.rowcount
+            cur2 = conn.execute(
+                "UPDATE reconciliations SET status='failed', completed_at=?,"
+                " error=? WHERE status='pending' AND accepted_at<?",
+                (now, "interrupted before completion", cutoff),
+            )
+            return cur.rowcount + cur2.rowcount
 
     # ----------------------------------------------------------------- intake
 
@@ -535,6 +596,15 @@ class Store:
                     " VALUES (?, ?, ?, ?, ?)",
                     (trace_id, batch_no, version, now, reason),
                 )
+            invalidated_reconciliations = self._invalidate_reconciliations(
+                conn,
+                intake_id,
+                batch_no,
+                reason=(
+                    f"batch {batch_no!r} corrected from version {version} to"
+                    f" version {new_version}"
+                ),
+            )
             return {
                 "batch_no": batch_no,
                 "previous_version": version,
@@ -544,6 +614,7 @@ class Store:
                 "departed_at": departed_at,
                 "arrived_at": arrived_at,
                 "invalidated_trace_ids": invalidated,
+                "invalidated_reconciliation_ids": invalidated_reconciliations,
             }
 
     # ---------------------------------------------------------------- traces
@@ -815,6 +886,370 @@ class Store:
                 " (SELECT COUNT(*) FROM trace_invalidations i"
                 "   WHERE i.trace_id=t.id) AS invalidation_count"
                 " FROM traces t ORDER BY t.id DESC"
+            ).fetchall()
+
+    # ------------------------------------------------------- scan receipts
+
+    def record_scans(self, *, scans: list[dict[str, Any]]) -> dict[str, Any]:
+        """Record scan receipts atomically.
+
+        Each receipt carries a client-supplied ``scan_id``. Re-submitting a
+        ``scan_id`` with identical content is an idempotent no-op; the same
+        id with different content rejects the whole request. Receipts for
+        unknown batches are rejected. Every newly recorded receipt marks the
+        completed reconciliations of its batch stale, in the same transaction.
+
+        Raises:
+            NotFoundError: no active dataset.
+            InvalidReferenceError: a receipt names an unknown batch.
+            ConflictError: a ``scan_id`` was already recorded with different
+                content.
+        """
+        now = iso(utcnow())
+        with self.transaction() as conn:
+            intake_id = self._active_intake_id(conn, create=False)
+            if intake_id is None:
+                raise NotFoundError("no active dataset")
+
+            receipts: list[dict[str, Any]] = []
+            inserted_by_batch: dict[str, list[str]] = {}
+            for scan in scans:
+                existing = conn.execute(
+                    "SELECT * FROM scans WHERE intake_id=? AND scan_id=?",
+                    (intake_id, scan["scan_id"]),
+                ).fetchone()
+                if existing is not None:
+                    same = (
+                        existing["batch_no"] == scan["batch_no"]
+                        and existing["direction"] == scan["direction"]
+                        and existing["site"] == scan["site"]
+                        and existing["scanned_at"] == iso(scan["scanned_at"])
+                    )
+                    if same:
+                        receipts.append({**scan, "outcome": "duplicate"})
+                        continue
+                    raise ConflictError(
+                        f"scan {scan['scan_id']!r} was already recorded with"
+                        " different content; refusing to record a second"
+                        " version of the same scan id"
+                    )
+                live = conn.execute(
+                    "SELECT 1 FROM batches WHERE intake_id=? AND batch_no=?"
+                    " AND superseded=0",
+                    (intake_id, scan["batch_no"]),
+                ).fetchone()
+                if live is None:
+                    raise InvalidReferenceError(
+                        f"scan {scan['scan_id']!r} references unknown batch"
+                        f" {scan['batch_no']!r}"
+                    )
+                conn.execute(
+                    "INSERT INTO scans(intake_id, scan_id, batch_no,"
+                    " direction, site, scanned_at, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        intake_id,
+                        scan["scan_id"],
+                        scan["batch_no"],
+                        scan["direction"],
+                        scan["site"],
+                        iso(scan["scanned_at"]),
+                        now,
+                    ),
+                )
+                receipts.append({**scan, "outcome": "recorded"})
+                inserted_by_batch.setdefault(scan["batch_no"], []).append(
+                    scan["scan_id"]
+                )
+
+            invalidated: list[int] = []
+            for batch_no, scan_ids in inserted_by_batch.items():
+                invalidated.extend(
+                    self._invalidate_reconciliations(
+                        conn,
+                        intake_id,
+                        batch_no,
+                        reason=(
+                            f"{len(scan_ids)} new scan receipt(s) recorded for"
+                            f" batch {batch_no!r}: {', '.join(sorted(scan_ids))}"
+                        ),
+                    )
+                )
+            return {
+                "recorded": sum(1 for r in receipts if r["outcome"] == "recorded"),
+                "duplicates": sum(
+                    1 for r in receipts if r["outcome"] == "duplicate"
+                ),
+                "scans": receipts,
+                "invalidated_reconciliation_ids": sorted(set(invalidated)),
+            }
+
+    def scans_for_batch(self, batch_no: str) -> list[dict[str, Any]] | None:
+        """All receipts for one batch, in recording order.
+
+        Returns ``None`` when the batch is unknown in the active dataset.
+        """
+        with self.connection() as conn:
+            intake_id = self._active_intake_id(conn, create=False)
+            if intake_id is None:
+                return None
+            live = conn.execute(
+                "SELECT 1 FROM batches WHERE intake_id=? AND batch_no=?"
+                " AND superseded=0",
+                (intake_id, batch_no),
+            ).fetchone()
+            if live is None:
+                return None
+            rows = conn.execute(
+                "SELECT * FROM scans WHERE intake_id=? AND batch_no=?"
+                " ORDER BY id",
+                (intake_id, batch_no),
+            ).fetchall()
+            return [self._scan_out(row) for row in rows]
+
+    @staticmethod
+    def _scan_out(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "scan_id": row["scan_id"],
+            "batch_no": row["batch_no"],
+            "direction": row["direction"],
+            "site": row["site"],
+            "scanned_at": parse_iso(row["scanned_at"]),
+            "recorded_at": parse_iso(row["created_at"]),
+        }
+
+    # ------------------------------------------------------ reconciliations
+
+    @staticmethod
+    def _invalidate_reconciliations(
+        conn: sqlite3.Connection, intake_id: int, batch_no: str, *, reason: str
+    ) -> list[int]:
+        """Mark every completed reconciliation of ``batch_no`` stale."""
+        rows = conn.execute(
+            "SELECT id FROM reconciliations WHERE intake_id=? AND batch_no=?"
+            " AND status='complete'",
+            (intake_id, batch_no),
+        ).fetchall()
+        now = iso(utcnow())
+        ids = sorted(int(row["id"]) for row in rows)
+        for reconciliation_id in ids:
+            conn.execute(
+                "INSERT INTO reconciliation_invalidations(reconciliation_id,"
+                " reason, invalidated_at) VALUES (?, ?, ?)",
+                (reconciliation_id, reason, now),
+            )
+        return ids
+
+    def accept_reconciliation(
+        self, *, batch_no: str
+    ) -> tuple[int, dict[str, Any], list[dict[str, Any]]]:
+        """Pin the batch version and its receipt set, atomically.
+
+        Reading the ledger record and the receipts and inserting the
+        ``pending`` reconciliation happen in one ``BEGIN IMMEDIATE``
+        transaction, so a concurrent scan or correction can never land
+        between "what we saw" and "what we pinned".
+
+        Returns:
+            ``(reconciliation_id, batch, scans)``: the pinned ledger record
+            and the pinned receipt set, which the computation must use.
+
+        Raises:
+            NotFoundError: no active dataset, or unknown batch.
+        """
+        with self.transaction() as conn:
+            intake_id = self._active_intake_id(conn, create=False)
+            if intake_id is None:
+                raise NotFoundError("no active dataset")
+            batch = conn.execute(
+                "SELECT * FROM batches WHERE intake_id=? AND batch_no=?"
+                " AND superseded=0",
+                (intake_id, batch_no),
+            ).fetchone()
+            if batch is None:
+                raise NotFoundError(f"batch {batch_no!r} not found")
+            scans = conn.execute(
+                "SELECT * FROM scans WHERE intake_id=? AND batch_no=?"
+                " ORDER BY id",
+                (intake_id, batch_no),
+            ).fetchall()
+            highwater = int(scans[-1]["id"]) if scans else 0
+            cur = conn.execute(
+                "INSERT INTO reconciliations(intake_id, batch_no, status,"
+                " batch_version, scan_highwater, scan_count, accepted_at)"
+                " VALUES (?, ?, 'pending', ?, ?, ?, ?)",
+                (
+                    intake_id,
+                    batch_no,
+                    int(batch["version"]),
+                    highwater,
+                    len(scans),
+                    iso(utcnow()),
+                ),
+            )
+            pinned_batch = {
+                "batch_no": batch["batch_no"],
+                "version": int(batch["version"]),
+                "origin": batch["origin"],
+                "destination": batch["destination"],
+                "departed_at": parse_iso(batch["departed_at"]),
+                "arrived_at": parse_iso(batch["arrived_at"]),
+            }
+            pinned_scans = [self._scan_out(row) for row in scans]
+            return int(cur.lastrowid), pinned_batch, pinned_scans
+
+    def publish_reconciliation(
+        self, reconciliation_id: int, findings: list[dict[str, Any]]
+    ) -> None:
+        """Publish every finding and the complete flag in one transaction.
+
+        Refuses to publish when the pinned batch version or the pinned
+        receipt set changed while the report was being computed.
+        """
+        now = iso(utcnow())
+        with self.transaction() as conn:
+            recon = conn.execute(
+                "SELECT * FROM reconciliations WHERE id=?",
+                (reconciliation_id,),
+            ).fetchone()
+            if recon is None:
+                raise NotFoundError("reconciliation not found")
+            if recon["status"] != "pending":
+                raise ConflictError(
+                    f"reconciliation {reconciliation_id} is"
+                    f" {recon['status']}, not pending"
+                )
+            intake_id = int(recon["intake_id"])
+            batch_no = recon["batch_no"]
+            live = conn.execute(
+                "SELECT version FROM batches WHERE intake_id=? AND batch_no=?"
+                " AND superseded=0",
+                (intake_id, batch_no),
+            ).fetchone()
+            live_version = int(live["version"]) if live is not None else None
+            if live_version != int(recon["batch_version"]):
+                raise ConflictError(
+                    f"batch {batch_no!r} moved to version {live_version}"
+                    " during reconciliation; not publishing a stale report"
+                )
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) AS highwater, COUNT(*) AS n"
+                " FROM scans WHERE intake_id=? AND batch_no=?",
+                (intake_id, batch_no),
+            ).fetchone()
+            if int(row["highwater"]) != int(recon["scan_highwater"]) or int(
+                row["n"]
+            ) != int(recon["scan_count"]):
+                raise ConflictError(
+                    f"new scan receipts arrived for batch {batch_no!r} during"
+                    " reconciliation; not publishing a stale report"
+                )
+            for rank, finding in enumerate(findings):
+                detail = dict(finding)
+                for key in ("expected_at", "actual_at"):
+                    if detail.get(key) is not None:
+                        detail[key] = iso(detail[key])
+                conn.execute(
+                    "INSERT INTO reconciliation_findings(reconciliation_id,"
+                    " rank, kind, direction, detail_json)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        reconciliation_id,
+                        rank,
+                        finding["kind"],
+                        finding["direction"],
+                        json.dumps(detail, sort_keys=True),
+                    ),
+                )
+            conn.execute(
+                "UPDATE reconciliations SET status='complete', completed_at=?,"
+                " error=NULL WHERE id=?",
+                (now, reconciliation_id),
+            )
+
+    def fail_reconciliation(self, reconciliation_id: int, error: str) -> None:
+        """Delete any partial findings and record the failure."""
+        with self.transaction() as conn:
+            conn.execute(
+                "DELETE FROM reconciliation_findings WHERE reconciliation_id=?",
+                (reconciliation_id,),
+            )
+            conn.execute(
+                "UPDATE reconciliations SET status='failed', completed_at=?,"
+                " error=? WHERE id=? AND status='pending'",
+                (iso(utcnow()), error, reconciliation_id),
+            )
+
+    def read_reconciliation(
+        self, reconciliation_id: int
+    ) -> dict[str, Any] | None:
+        """Read a reconciliation and everything needed to render it.
+
+        A single read transaction keeps the header, its findings, its
+        invalidation markers and its pinned inputs mutually consistent.
+
+        Returns ``None`` for an unknown reconciliation.
+        """
+        with self.connection() as conn:
+            conn.execute("BEGIN")
+            try:
+                recon = conn.execute(
+                    "SELECT * FROM reconciliations WHERE id=?",
+                    (reconciliation_id,),
+                ).fetchone()
+                if recon is None:
+                    return None
+                findings = conn.execute(
+                    "SELECT * FROM reconciliation_findings"
+                    " WHERE reconciliation_id=? ORDER BY rank",
+                    (reconciliation_id,),
+                ).fetchall()
+                invalidations = conn.execute(
+                    "SELECT * FROM reconciliation_invalidations"
+                    " WHERE reconciliation_id=? ORDER BY rowid",
+                    (reconciliation_id,),
+                ).fetchall()
+                intake_id = int(recon["intake_id"])
+                batch = conn.execute(
+                    "SELECT * FROM batches WHERE intake_id=? AND batch_no=?"
+                    " AND version=?",
+                    (intake_id, recon["batch_no"], int(recon["batch_version"])),
+                ).fetchone()
+                scans = conn.execute(
+                    "SELECT * FROM scans WHERE intake_id=? AND batch_no=?"
+                    " AND id<=? ORDER BY id",
+                    (
+                        intake_id,
+                        recon["batch_no"],
+                        int(recon["scan_highwater"]),
+                    ),
+                ).fetchall()
+                return {
+                    "reconciliation": recon,
+                    "findings": findings,
+                    "invalidations": invalidations,
+                    "batch": batch,
+                    "scans": [self._scan_out(row) for row in scans],
+                }
+            finally:
+                conn.execute("COMMIT")
+
+    def reconciliation(self, reconciliation_id: int) -> sqlite3.Row | None:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM reconciliations WHERE id=?",
+                (reconciliation_id,),
+            ).fetchone()
+
+    def reconciliation_history(self) -> list[sqlite3.Row]:
+        with self.connection() as conn:
+            return conn.execute(
+                "SELECT r.*,"
+                " (SELECT COUNT(*) FROM reconciliation_findings f"
+                "   WHERE f.reconciliation_id=r.id) AS finding_count,"
+                " (SELECT COUNT(*) FROM reconciliation_invalidations i"
+                "   WHERE i.reconciliation_id=r.id) AS invalidation_count"
+                " FROM reconciliations r ORDER BY r.id DESC"
             ).fetchall()
 
     # ----------------------------------------------------------------- audit

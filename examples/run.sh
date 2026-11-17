@@ -82,3 +82,56 @@ curl -sS -o "$WORK/stale.json" -w 'HTTP %{http_code}\n' \
     "arrived_at": "2026-01-01T21:00:00Z"
   }'
 pretty <"$WORK/stale.json" || cat "$WORK/stale.json"
+
+echo
+echo "== record scan receipts for B${RUN}-1001 (arrival scanned 5 min late) =="
+curl -fsS -X POST "$API/scans" \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"scans\": [
+      {\"scan_id\": \"SC${RUN}-1\", \"batch_no\": \"B${RUN}-1001\",
+       \"direction\": \"departure\", \"site\": \"Collection-Lab\",
+       \"scanned_at\": \"2026-01-01T08:00:00Z\"},
+      {\"scan_id\": \"SC${RUN}-2\", \"batch_no\": \"B${RUN}-1001\",
+       \"direction\": \"arrival\", \"site\": \"Hub-North\",
+       \"scanned_at\": \"2026-01-01T10:05:00Z\"}
+    ]
+  }" | pretty
+
+echo
+echo "== identical re-report is idempotent (duplicates, nothing recorded) =="
+curl -fsS -X POST "$API/scans" \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"scans\": [
+      {\"scan_id\": \"SC${RUN}-1\", \"batch_no\": \"B${RUN}-1001\",
+       \"direction\": \"departure\", \"site\": \"Collection-Lab\",
+       \"scanned_at\": \"2026-01-01T08:00:00Z\"}
+    ]
+  }" | pretty
+
+echo
+echo "== reconcile B${RUN}-1001: arrival time mismatches the ledger =="
+RECON=$(curl -fsS -X POST "$API/batches/B${RUN}-1001/reconciliations")
+echo "$RECON" | pretty
+RECON_ID=$(echo "$RECON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["reconciliation_id"])')
+
+echo
+echo "== correct B${RUN}-1001 to the scanned arrival time; report goes stale =="
+curl -fsS -X POST "$API/batches/B${RUN}-1001/corrections" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "seen_version": 1,
+    "origin": "Collection-Lab",
+    "destination": "Hub-North",
+    "departed_at": "2026-01-01T08:00:00Z",
+    "arrived_at": "2026-01-01T10:05:00Z"
+  }' | pretty
+
+echo
+echo "== the old report stays readable but is marked stale =="
+curl -fsS "$API/reconciliations/$RECON_ID" | pretty
+
+echo
+echo "== a fresh reconciliation against the corrected ledger matches =="
+curl -fsS -X POST "$API/batches/B${RUN}-1001/reconciliations" | pretty

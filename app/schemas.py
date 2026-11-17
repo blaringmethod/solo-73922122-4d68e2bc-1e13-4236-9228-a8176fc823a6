@@ -7,7 +7,7 @@ Responses always use ``Z``.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -416,6 +416,7 @@ class CorrectionResponse(BaseModel):
     departed_at: datetime
     arrived_at: datetime
     invalidated_trace_ids: list[int]
+    invalidated_reconciliation_ids: list[int] = Field(default_factory=list)
 
 
 class DatasetResponse(BaseModel):
@@ -424,6 +425,179 @@ class DatasetResponse(BaseModel):
     samples: list[SampleOut]
     batches: list[BatchOut]
     source_sample_ids: list[str]
+
+
+# ------------------------------------------------------------------ scans
+
+EXAMPLE_SCANS = {
+    "scans": [
+        {
+            "scan_id": "SC-0001",
+            "batch_no": "B-1001",
+            "direction": "departure",
+            "site": "Collection-Lab",
+            "scanned_at": "2026-01-01T08:00:00Z",
+        },
+        {
+            "scan_id": "SC-0002",
+            "batch_no": "B-1001",
+            "direction": "arrival",
+            "site": "Hub-North",
+            "scanned_at": "2026-01-01T10:00:00Z",
+        },
+    ]
+}
+
+
+class ScanIn(BaseModel):
+    """One site scan receipt: a batch scanned out of / into storage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scan_id: str = Field(
+        max_length=128,
+        description="Unique receipt id assigned by the scanning station.",
+    )
+    batch_no: str = Field(max_length=128)
+    direction: Literal["departure", "arrival"] = Field(
+        description="`departure` = scanned out of storage (离库);"
+        " `arrival` = scanned into storage (入库)."
+    )
+    site: str = Field(max_length=256)
+    scanned_at: datetime = Field(description="UTC instant of the scan.")
+
+    _normalise_strings = field_validator("scan_id", "batch_no", "site")(
+        lambda v, info: _clean(v, info.field_name)
+    )
+
+    @field_validator("scanned_at")
+    @classmethod
+    def _aware(cls, v: datetime, info) -> datetime:
+        return _to_utc(v, info.field_name)
+
+    def normalised(self) -> dict[str, Any]:
+        return {
+            "scan_id": self.scan_id,
+            "batch_no": self.batch_no,
+            "direction": self.direction,
+            "site": self.site,
+            "scanned_at": self.scanned_at,
+        }
+
+
+class ScanBatchRequest(BaseModel):
+    """A set of scan receipts. Recorded atomically.
+
+    Re-sending a receipt with identical content is idempotent; re-using a
+    ``scan_id`` with different content rejects the whole request with 409.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid", json_schema_extra={"example": EXAMPLE_SCANS}
+    )
+
+    scans: list[ScanIn] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _unique_ids(self) -> "ScanBatchRequest":
+        ids = [s.scan_id for s in self.scans]
+        if len(set(ids)) != len(ids):
+            raise ValueError("duplicate scan_id in scans")
+        return self
+
+
+class ScanReceipt(BaseModel):
+    """Per-scan outcome of a receipt submission."""
+
+    scan_id: str
+    batch_no: str
+    direction: str
+    site: str
+    scanned_at: datetime
+    outcome: str = Field(description="`recorded` or `duplicate` (idempotent).")
+
+
+class ScanBatchResponse(BaseModel):
+    recorded: int
+    duplicates: int
+    scans: list[ScanReceipt]
+    invalidated_reconciliation_ids: list[int] = Field(
+        description="Published reconciliation reports marked stale by the"
+        " newly recorded receipts."
+    )
+
+
+class ScanOut(BaseModel):
+    scan_id: str
+    batch_no: str
+    direction: str
+    site: str
+    scanned_at: datetime
+    recorded_at: datetime
+
+    @field_validator("scanned_at", "recorded_at", mode="before")
+    @classmethod
+    def _utc(cls, v: Any, info) -> Any:
+        return _to_utc(v, info.field_name) if isinstance(v, datetime) else v
+
+
+# ---------------------------------------------------------- reconciliations
+
+
+class FindingOut(BaseModel):
+    """One discrepancy between the ledger and the scan receipts."""
+
+    kind: str = Field(
+        description="missing_receipt | duplicate_direction | site_mismatch |"
+        " time_mismatch"
+    )
+    direction: str
+    scan_ids: list[str]
+    expected_site: str | None = None
+    actual_site: str | None = None
+    expected_at: datetime | None = None
+    actual_at: datetime | None = None
+    message: str
+
+
+class ReconciliationInvalidationInfo(BaseModel):
+    reason: str
+    invalidated_at: datetime
+
+
+class ReconciliationResponse(BaseModel):
+    reconciliation_id: int
+    status: str
+    batch_no: str
+    matched: bool = Field(
+        description="True when the receipts matched the ledger exactly."
+    )
+    findings: list[FindingOut]
+    finding_count: int
+    stale: bool = Field(
+        description="True when a newer scan receipt or a batch correction"
+        " superseded this report after publication."
+    )
+    invalidations: list[ReconciliationInvalidationInfo]
+    ledger: BatchOut = Field(description="The pinned batch record used.")
+    scans: list[ScanOut] = Field(description="The pinned receipt set used.")
+    accepted_at: datetime
+    completed_at: datetime | None = None
+    error: str | None = None
+
+
+class ReconciliationSummary(BaseModel):
+    reconciliation_id: int
+    batch_no: str
+    status: str
+    accepted_at: datetime
+    completed_at: datetime | None = None
+    finding_count: int
+    stale: bool
+
+
+class ReconciliationListResponse(BaseModel):
+    reconciliations: list[ReconciliationSummary]
 
 
 class ErrorBody(BaseModel):

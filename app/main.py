@@ -1,4 +1,4 @@
-"""FastAPI application for contamination tracing.
+"""FastAPI application for contamination tracing and receipt reconciliation.
 
 Endpoints
 ---------
@@ -9,6 +9,12 @@ Endpoints
 ``POST /traces``                   run a trace on a pinned snapshot
 ``GET  /traces``                    list accepted traces
 ``GET  /traces/{id}``               re-read a published snapshot result
+``POST /scans``                    record site scan receipts (idempotent)
+``GET  /batches/{batch_no}/scans``  list receipts recorded for a batch
+``POST /batches/{batch_no}/reconciliations``
+                                   reconcile receipts against the pinned ledger
+``GET  /reconciliations``           list reconciliation reports
+``GET  /reconciliations/{id}``      read one report with its staleness status
 ``GET  /healthz``                   readiness probe
 """
 from __future__ import annotations
@@ -22,7 +28,7 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from . import tracing
+from . import reconcile, tracing
 from .schemas import (
     AffectedSample,
     BatchCorrection,
@@ -30,10 +36,18 @@ from .schemas import (
     CorrectionResponse,
     DatasetResponse,
     ErrorBody,
+    FindingOut,
     IntakeRequest,
     IntakeResponse,
     InvalidationInfo,
     PathLeg,
+    ReconciliationInvalidationInfo,
+    ReconciliationListResponse,
+    ReconciliationResponse,
+    ReconciliationSummary,
+    ScanBatchRequest,
+    ScanBatchResponse,
+    ScanOut,
     SnapshotInfo,
     TraceListResponse,
     TraceRequest,
@@ -63,9 +77,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     app = FastAPI(
         title="Sample Contamination Trace API",
-        version="1.0.0",
+        version="1.1.0",
         description=(
-            "Trace contamination reachability across sample transfer batches.\n\n"
+            "Trace contamination reachability across sample transfer batches,"
+            " and reconcile site scan receipts against the transfer ledger.\n\n"
             "* A transfer batch is contaminated when it carries a source sample,"
             " or when it leaves a site within 24 hours of a contaminated batch"
             " arriving there.\n"
@@ -76,13 +91,26 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "* Corrections are versioned (`seen_version` optimistic lock),"
             " replace the old record and invalidate snapshots pinned to it.\n"
             "* `POST /traces` pins a snapshot at acceptance time and publishes"
-            " results only when complete; failed traces expose no partial rows."
+            " results only when complete; failed traces expose no partial rows.\n"
+            "* Scan receipts are idempotent per `scan_id`: identical re-reports"
+            " are no-ops, conflicting content is rejected.\n"
+            "* `POST /batches/{batch_no}/reconciliations` pins the batch version"
+            " and the receipt set at acceptance, re-checks both before"
+            " publishing, and never publishes half a report. A published report"
+            " is marked stale by new receipts for its batch or by a batch"
+            " correction; identical re-reports and other batches do not affect"
+            " it."
         ),
         lifespan=lifespan,
         openapi_tags=[
             {"name": "intake", "description": "Register samples and batches."},
             {"name": "corrections", "description": "Versioned batch replacement."},
             {"name": "traces", "description": "Contamination trace snapshots."},
+            {"name": "receipts", "description": "Site scan receipts."},
+            {
+                "name": "reconciliation",
+                "description": "Receipt-vs-ledger reconciliation reports.",
+            },
         ],
     )
     app.state.store = store
@@ -152,6 +180,49 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 batches=[BatchOut(**row) for row in bundle["batches"]],
             ),
             error=trace["error"],
+        )
+
+    def _reconciliation_response(bundle: Any) -> ReconciliationResponse:
+        recon = bundle["reconciliation"]
+        invalidations = bundle["invalidations"]
+        if recon["status"] == "complete":
+            findings = [
+                FindingOut(**_load_json(row["detail_json"]))
+                for row in bundle["findings"]
+            ]
+        else:
+            # Failed and pending reconciliations never expose findings.
+            findings = []
+        batch_row = bundle["batch"]
+        return ReconciliationResponse(
+            reconciliation_id=int(recon["id"]),
+            status=recon["status"],
+            batch_no=recon["batch_no"],
+            matched=not findings,
+            findings=findings,
+            finding_count=len(findings),
+            stale=bool(invalidations),
+            invalidations=[
+                ReconciliationInvalidationInfo(
+                    reason=row["reason"],
+                    invalidated_at=parse_iso(row["invalidated_at"]),
+                )
+                for row in invalidations
+            ],
+            ledger=BatchOut(
+                batch_no=batch_row["batch_no"],
+                version=int(batch_row["version"]),
+                origin=batch_row["origin"],
+                destination=batch_row["destination"],
+                departed_at=parse_iso(batch_row["departed_at"]),
+                arrived_at=parse_iso(batch_row["arrived_at"]),
+            ),
+            scans=[ScanOut(**row) for row in bundle["scans"]],
+            accepted_at=parse_iso(recon["accepted_at"]),
+            completed_at=parse_iso(recon["completed_at"])
+            if recon["completed_at"]
+            else None,
+            error=recon["error"],
         )
 
     # ----------------------------------------------------------------- routes
@@ -406,6 +477,193 @@ def create_app(db_path: str | None = None) -> FastAPI:
             )
             for row in store.invalidations(trace_id)
         ]
+
+    # ---------------------------------------------------------- receipts
+
+    @app.post(
+        "/scans",
+        response_model=ScanBatchResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["receipts"],
+        summary="Record site scan receipts (idempotent per scan_id)",
+        responses={
+            404: {"model": ErrorBody, "description": "No dataset yet"},
+            409: {"model": ErrorBody, "description": "scan_id reused with"
+                  " different content"},
+            422: {"model": ErrorBody, "description": "Invalid payload or"
+                  " unknown batch"},
+        },
+    )
+    def record_scans(payload: ScanBatchRequest) -> ScanBatchResponse:
+        try:
+            result = store.record_scans(
+                scans=[scan.normalised() for scan in payload.scans]
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InvalidReferenceError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except ConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        store.log(
+            "scans",
+            {"recorded": result["recorded"], "duplicates": result["duplicates"]},
+        )
+        return ScanBatchResponse(**result)
+
+    @app.get(
+        "/batches/{batch_no}/scans",
+        response_model=list[ScanOut],
+        tags=["receipts"],
+        summary="List scan receipts recorded for a batch",
+        responses={404: {"model": ErrorBody, "description": "Unknown batch"}},
+    )
+    def list_scans(batch_no: str) -> list[ScanOut]:
+        scans = store.scans_for_batch(batch_no)
+        if scans is None:
+            raise HTTPException(status_code=404, detail="batch not found")
+        return [ScanOut(**row) for row in scans]
+
+    # ---------------------------------------------------- reconciliations
+
+    @app.post(
+        "/batches/{batch_no}/reconciliations",
+        response_model=ReconciliationResponse,
+        status_code=status.HTTP_201_CREATED,
+        tags=["reconciliation"],
+        summary="Reconcile a batch's scan receipts against the pinned ledger",
+        responses={
+            404: {"model": ErrorBody, "description": "Unknown batch"},
+            409: {"model": ErrorBody, "description": "Ledger or receipt set"
+                  " changed during computation"},
+            500: {"model": ErrorBody, "description": "Reconciliation failed;"
+                  " nothing published"},
+        },
+    )
+    def run_reconciliation(batch_no: str) -> ReconciliationResponse:
+        try:
+            recon_id, pinned_batch, pinned_scans = store.accept_reconciliation(
+                batch_no=batch_no
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        try:
+            outcome = reconcile.reconcile(
+                batch=pinned_batch, scans=pinned_scans
+            )
+            store.publish_reconciliation(recon_id, outcome["findings"])
+        except ConflictError as exc:
+            # Ledger or receipt set moved under us: refusal, not a stale report.
+            store.fail_reconciliation(recon_id, str(exc))
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "reconciliation_changed",
+                    "message": str(exc),
+                    "details": {
+                        "reconciliation_id": recon_id,
+                        "status": "failed",
+                    },
+                },
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - recorded, never half-published
+            store.fail_reconciliation(recon_id, f"{type(exc).__name__}: {exc}")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "reconciliation_failed",
+                    "message": f"{type(exc).__name__}: {exc}",
+                    "details": {
+                        "reconciliation_id": recon_id,
+                        "status": "failed",
+                    },
+                },
+            ) from exc
+
+        stored = store.read_reconciliation(recon_id)
+        assert stored is not None
+        store.log(
+            "reconciliation",
+            {
+                "reconciliation_id": recon_id,
+                "batch_no": batch_no,
+                "findings": len(outcome["findings"]),
+            },
+        )
+        return _reconciliation_response(stored)
+
+    @app.get(
+        "/reconciliations",
+        response_model=ReconciliationListResponse,
+        tags=["reconciliation"],
+        summary="List reconciliation reports",
+    )
+    def list_reconciliations() -> ReconciliationListResponse:
+        rows = store.reconciliation_history()
+        return ReconciliationListResponse(
+            reconciliations=[
+                ReconciliationSummary(
+                    reconciliation_id=int(row["id"]),
+                    batch_no=row["batch_no"],
+                    status=row["status"],
+                    accepted_at=parse_iso(row["accepted_at"]),
+                    completed_at=parse_iso(row["completed_at"])
+                    if row["completed_at"]
+                    else None,
+                    finding_count=int(row["finding_count"]),
+                    stale=int(row["invalidation_count"]) > 0,
+                )
+                for row in rows
+            ]
+        )
+
+    @app.get(
+        "/reconciliations/{reconciliation_id}",
+        response_model=ReconciliationResponse,
+        tags=["reconciliation"],
+        summary="Read one report: findings plus staleness status",
+        responses={
+            404: {"model": ErrorBody, "description": "Unknown reconciliation"},
+            409: {"model": ErrorBody, "description": "Not published yet"},
+            500: {"model": ErrorBody, "description": "Reconciliation failed"},
+        },
+    )
+    def get_reconciliation(reconciliation_id: int) -> ReconciliationResponse:
+        bundle = store.read_reconciliation(reconciliation_id)
+        if bundle is None:
+            raise HTTPException(status_code=404, detail="reconciliation not found")
+        recon = bundle["reconciliation"]
+        if recon["status"] == "failed":
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "reconciliation_failed",
+                    "message": recon["error"] or "reconciliation failed",
+                    "details": {
+                        "reconciliation_id": reconciliation_id,
+                        "status": "failed",
+                    },
+                },
+            )
+        if recon["status"] != "complete":
+            # A pending reconciliation has no published findings. Returning an
+            # empty list with 200 would be indistinguishable from "matched".
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "reconciliation_pending",
+                    "message": "reconciliation has not been published yet;"
+                    " retry later",
+                    "details": {
+                        "reconciliation_id": reconciliation_id,
+                        "status": recon["status"],
+                    },
+                },
+            )
+        # Stale reports stay readable: the caller asked for the findings and
+        # the staleness status, and gets both.
+        return _reconciliation_response(bundle)
 
     return app
 
